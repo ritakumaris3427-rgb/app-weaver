@@ -2,6 +2,7 @@ import { motion } from 'framer-motion';
 import { User, Sparkles } from 'lucide-react';
 import { Message } from '@/types/chat';
 import { MarkdownRenderer } from './MarkdownRenderer';
+import { MessageAttachments } from './MessageAttachments';
 import { cn } from '@/lib/utils';
 
 interface ChatMessageProps {
@@ -63,6 +64,10 @@ export function ChatMessage({ message }: ChatMessageProps) {
             </>
           )}
         </div>
+
+        {message.attachments && message.attachments.length > 0 && (
+          <MessageAttachments attachments={message.attachments} />
+        )}
       </div>
     </motion.div>
   );

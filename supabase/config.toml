@@ -32,3 +32,6 @@ enable_confirmations = false
 
 [functions.chat]
 verify_jwt = false
+
+[functions.generate-image]
+verify_jwt = false

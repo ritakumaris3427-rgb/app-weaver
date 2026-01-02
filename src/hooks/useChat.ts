@@ -3,14 +3,7 @@ import { Message } from '@/types/chat';
 
 const generateId = () => Math.random().toString(36).substring(2, 15);
 
-// Mock AI responses for demo (will be replaced with real AI)
-const mockResponses = [
-  "I understand you're looking to build something impressive. Let me help you architect a solution that's both scalable and maintainable.\n\n**Key considerations:**\n\n1. **Architecture**: Use a modular component structure\n2. **Performance**: Implement lazy loading and code splitting\n3. **UX**: Focus on responsive design and smooth animations\n\n```typescript\n// Example component structure\ninterface ComponentProps {\n  data: DataType;\n  onAction: () => void;\n}\n```\n\nWould you like me to elaborate on any of these points?",
-  
-  "Great question! Here's how I'd approach this:\n\n## Solution Overview\n\nThe key is to break down the problem into manageable pieces. Let's start with the core functionality:\n\n```javascript\nconst handleSubmit = async (data) => {\n  try {\n    const result = await processData(data);\n    return { success: true, data: result };\n  } catch (error) {\n    console.error('Processing failed:', error);\n    return { success: false, error: error.message };\n  }\n};\n```\n\n### Next Steps\n- Implement error boundaries\n- Add loading states\n- Write unit tests\n\nLet me know if you need more details on any step.",
-
-  "I'll help you build this properly. Here's a production-ready approach:\n\n**Database Schema:**\n```sql\nCREATE TABLE users (\n  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),\n  email VARCHAR(255) UNIQUE NOT NULL,\n  created_at TIMESTAMPTZ DEFAULT NOW()\n);\n```\n\n**API Endpoint:**\n```typescript\nexport async function POST(req: Request) {\n  const body = await req.json();\n  // Validate input\n  // Process request\n  // Return response\n}\n```\n\nThis ensures type safety, proper error handling, and follows REST best practices.",
-];
+const CHAT_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/chat`;
 
 export function useChat() {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -29,7 +22,6 @@ export function useChat() {
     setMessages(prev => [...prev, userMessage]);
     setIsLoading(true);
 
-    // Simulate streaming response
     const assistantMessage: Message = {
       id: generateId(),
       role: 'assistant',
@@ -40,37 +32,119 @@ export function useChat() {
 
     setMessages(prev => [...prev, assistantMessage]);
 
-    // Get random mock response
-    const responseText = mockResponses[Math.floor(Math.random() * mockResponses.length)];
-    
-    // Simulate streaming by adding characters progressively
-    let currentIndex = 0;
-    const streamInterval = setInterval(() => {
-      if (currentIndex < responseText.length) {
-        const chunkSize = Math.floor(Math.random() * 5) + 1;
-        currentIndex = Math.min(currentIndex + chunkSize, responseText.length);
-        
-        setMessages(prev => 
-          prev.map(msg => 
-            msg.id === assistantMessage.id 
-              ? { ...msg, content: responseText.substring(0, currentIndex) }
-              : msg
-          )
-        );
-      } else {
-        clearInterval(streamInterval);
-        setMessages(prev => 
-          prev.map(msg => 
-            msg.id === assistantMessage.id 
-              ? { ...msg, isStreaming: false }
-              : msg
-          )
-        );
-        setIsLoading(false);
-      }
-    }, 15);
+    try {
+      // Build messages array for API
+      const apiMessages = [...messages, userMessage].map(msg => ({
+        role: msg.role,
+        content: msg.content,
+      }));
 
-  }, [isLoading]);
+      const response = await fetch(CHAT_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+        },
+        body: JSON.stringify({ messages: apiMessages }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.error || `Request failed with status ${response.status}`);
+      }
+
+      if (!response.body) {
+        throw new Error("No response body");
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let textBuffer = "";
+      let assistantContent = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        textBuffer += decoder.decode(value, { stream: true });
+
+        let newlineIndex: number;
+        while ((newlineIndex = textBuffer.indexOf("\n")) !== -1) {
+          let line = textBuffer.slice(0, newlineIndex);
+          textBuffer = textBuffer.slice(newlineIndex + 1);
+
+          if (line.endsWith("\r")) line = line.slice(0, -1);
+          if (line.startsWith(":") || line.trim() === "") continue;
+          if (!line.startsWith("data: ")) continue;
+
+          const jsonStr = line.slice(6).trim();
+          if (jsonStr === "[DONE]") break;
+
+          try {
+            const parsed = JSON.parse(jsonStr);
+            const deltaContent = parsed.choices?.[0]?.delta?.content;
+            if (deltaContent) {
+              assistantContent += deltaContent;
+              setMessages(prev =>
+                prev.map(msg =>
+                  msg.id === assistantMessage.id
+                    ? { ...msg, content: assistantContent }
+                    : msg
+                )
+              );
+            }
+          } catch {
+            // Incomplete JSON, put back and wait for more data
+            textBuffer = line + "\n" + textBuffer;
+            break;
+          }
+        }
+      }
+
+      // Final flush
+      if (textBuffer.trim()) {
+        for (let raw of textBuffer.split("\n")) {
+          if (!raw) continue;
+          if (raw.endsWith("\r")) raw = raw.slice(0, -1);
+          if (raw.startsWith(":") || raw.trim() === "") continue;
+          if (!raw.startsWith("data: ")) continue;
+          const jsonStr = raw.slice(6).trim();
+          if (jsonStr === "[DONE]") continue;
+          try {
+            const parsed = JSON.parse(jsonStr);
+            const deltaContent = parsed.choices?.[0]?.delta?.content;
+            if (deltaContent) {
+              assistantContent += deltaContent;
+            }
+          } catch { /* ignore */ }
+        }
+      }
+
+      // Mark streaming complete
+      setMessages(prev =>
+        prev.map(msg =>
+          msg.id === assistantMessage.id
+            ? { ...msg, content: assistantContent, isStreaming: false }
+            : msg
+        )
+      );
+    } catch (error) {
+      console.error("Chat error:", error);
+      setMessages(prev =>
+        prev.map(msg =>
+          msg.id === assistantMessage.id
+            ? {
+                ...msg,
+                content: `Error: ${error instanceof Error ? error.message : "Failed to get response"}`,
+                isStreaming: false,
+              }
+            : msg
+        )
+      );
+    } finally {
+      setIsLoading(false);
+    }
+  }, [messages, isLoading]);
 
   const clearMessages = useCallback(() => {
     setMessages([]);

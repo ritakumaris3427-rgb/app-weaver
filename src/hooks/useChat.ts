@@ -1,27 +1,129 @@
 import { useState, useCallback } from 'react';
-import { Message } from '@/types/chat';
+import { Message, Attachment } from '@/types/chat';
 
 const generateId = () => Math.random().toString(36).substring(2, 15);
 
 const CHAT_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/chat`;
+const IMAGE_GEN_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/generate-image`;
 
 export function useChat() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(false);
 
-  const sendMessage = useCallback(async (content: string) => {
-    if (!content.trim() || isLoading) return;
+  const generateImageFromPrompt = async (prompt: string): Promise<Attachment | null> => {
+    try {
+      const response = await fetch(IMAGE_GEN_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+        },
+        body: JSON.stringify({ prompt }),
+      });
+
+      if (!response.ok) {
+        throw new Error("Failed to generate image");
+      }
+
+      const data = await response.json();
+      return {
+        id: generateId(),
+        type: 'image',
+        url: data.imageUrl,
+        name: `Generated: ${prompt.slice(0, 30)}...`,
+      };
+    } catch (error) {
+      console.error("Image generation error:", error);
+      return null;
+    }
+  };
+
+  const sendMessage = useCallback(async (content: string, attachments?: Attachment[]) => {
+    if ((!content.trim() && (!attachments || attachments.length === 0)) || isLoading) return;
 
     const userMessage: Message = {
       id: generateId(),
       role: 'user',
       content: content.trim(),
       timestamp: new Date(),
+      attachments: attachments || [],
     };
 
     setMessages(prev => [...prev, userMessage]);
     setIsLoading(true);
 
+    // Check if user is asking to generate an image
+    const lowerContent = content.toLowerCase();
+    const isImageGenRequest = lowerContent.includes('generate image') || 
+                              lowerContent.includes('create image') ||
+                              lowerContent.includes('make image') ||
+                              lowerContent.includes('draw') ||
+                              lowerContent.includes('generate a picture') ||
+                              lowerContent.includes('create a picture');
+
+    if (isImageGenRequest) {
+      const assistantMessage: Message = {
+        id: generateId(),
+        role: 'assistant',
+        content: 'Generating your image...',
+        timestamp: new Date(),
+        isStreaming: true,
+        attachments: [{
+          id: generateId(),
+          type: 'image',
+          url: '',
+          isGenerating: true,
+        }],
+      };
+
+      setMessages(prev => [...prev, assistantMessage]);
+
+      try {
+        // Extract the image description from the request
+        const imagePrompt = content.replace(/generate\s*(an?\s*)?image\s*(of)?/i, '')
+                                   .replace(/create\s*(an?\s*)?image\s*(of)?/i, '')
+                                   .replace(/make\s*(an?\s*)?image\s*(of)?/i, '')
+                                   .replace(/draw\s*(an?\s*)?(picture\s*of)?/i, '')
+                                   .replace(/generate\s*(a\s*)?picture\s*(of)?/i, '')
+                                   .replace(/create\s*(a\s*)?picture\s*(of)?/i, '')
+                                   .trim() || content;
+
+        const generatedImage = await generateImageFromPrompt(imagePrompt);
+        
+        setMessages(prev =>
+          prev.map(msg =>
+            msg.id === assistantMessage.id
+              ? {
+                  ...msg,
+                  content: generatedImage 
+                    ? `Here's the image I generated based on your request: "${imagePrompt}"` 
+                    : 'Sorry, I couldn\'t generate the image. Please try again.',
+                  isStreaming: false,
+                  attachments: generatedImage ? [generatedImage] : [],
+                }
+              : msg
+          )
+        );
+      } catch (error) {
+        setMessages(prev =>
+          prev.map(msg =>
+            msg.id === assistantMessage.id
+              ? {
+                  ...msg,
+                  content: 'Sorry, there was an error generating the image.',
+                  isStreaming: false,
+                  attachments: [],
+                }
+              : msg
+          )
+        );
+      } finally {
+        setIsLoading(false);
+      }
+      return;
+    }
+
+    // Regular chat flow
     const assistantMessage: Message = {
       id: generateId(),
       role: 'assistant',
@@ -33,11 +135,20 @@ export function useChat() {
     setMessages(prev => [...prev, assistantMessage]);
 
     try {
-      // Build messages array for API
-      const apiMessages = [...messages, userMessage].map(msg => ({
-        role: msg.role,
-        content: msg.content,
-      }));
+      // Build messages array for API, include attachment descriptions
+      const apiMessages = [...messages, userMessage].map(msg => {
+        let msgContent = msg.content;
+        if (msg.attachments && msg.attachments.length > 0) {
+          const attachmentDesc = msg.attachments
+            .map(a => `[${a.type}: ${a.name || 'unnamed'}]`)
+            .join(' ');
+          msgContent = `${msgContent} ${attachmentDesc}`.trim();
+        }
+        return {
+          role: msg.role,
+          content: msgContent,
+        };
+      });
 
       const response = await fetch(CHAT_URL, {
         method: "POST",
@@ -94,7 +205,6 @@ export function useChat() {
               );
             }
           } catch {
-            // Incomplete JSON, put back and wait for more data
             textBuffer = line + "\n" + textBuffer;
             break;
           }
